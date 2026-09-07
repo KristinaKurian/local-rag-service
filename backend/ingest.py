@@ -1,8 +1,8 @@
 """PDF ingestion: load, chunk, embed, and persist to ChromaDB.
 
-Ingestion is idempotent per PDF path:
-- unchanged PDFs are skipped;
-- changed PDFs replace their previously indexed chunks;
+Ingestion is idempotent per PDF path and indexing configuration:
+- unchanged PDFs are skipped only when the stored index fingerprint matches;
+- changed PDFs are staged before old chunks are removed;
 - repeated POST /ingest calls do not grow the collection with duplicates.
 """
 
@@ -26,12 +26,7 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def get_embeddings() -> HuggingFaceEmbeddings:
-    """Create the embedding model once and reuse it for the process lifetime.
-
-    Loading a sentence-transformers model is relatively expensive. Both ingest
-    and query-side Chroma clients use this cached instance instead of loading
-    the same model repeatedly whenever the pipeline is rebuilt.
-    """
+    """Create the embedding model once and reuse it for the process lifetime."""
     return HuggingFaceEmbeddings(
         model_name=settings.embedding_model,
         model_kwargs={"device": settings.embedding_device},
@@ -69,9 +64,40 @@ def _document_id(pdf_path: Path, source_root: Path) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def _chunk_id(document_id: str, chunk_index: int) -> str:
-    """Create a deterministic id so the same logical chunk can be upserted safely."""
-    value = f"{document_id}:{chunk_index}"
+def _index_config_fingerprint() -> str:
+    """Fingerprint settings that change the persisted vector index representation.
+
+    The collection name is derived from this value so an embedding model or
+    chunking change never mixes incompatible vectors/chunks with an old index.
+    """
+    payload = "|".join(
+        [
+            f"schema={settings.index_schema_version}",
+            f"embedding_model={settings.embedding_model}",
+            f"normalize_embeddings={int(settings.normalize_embeddings)}",
+            f"chunk_size={settings.chunk_size}",
+            f"chunk_overlap={settings.chunk_overlap}",
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _effective_collection_name() -> str:
+    """Return a Chroma collection isolated by the current index configuration."""
+    suffix = _index_config_fingerprint()[:12]
+    base = settings.chroma_collection_name[:48].rstrip("._-") or "rag"
+    return f"{base}-{suffix}"
+
+
+def _document_index_fingerprint(document_hash: str) -> str:
+    """Fingerprint both PDF bytes and the configuration used to index them."""
+    value = f"{document_hash}:{_index_config_fingerprint()}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _chunk_id(document_id: str, index_fingerprint: str, chunk_index: int) -> str:
+    """Create a deterministic id for one chunk version."""
+    value = f"{document_id}:{index_fingerprint}:{chunk_index}"
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
@@ -97,12 +123,7 @@ def _find_existing_document(
     source_path: str,
     source_name: str,
 ) -> tuple[list[str], list[dict[str, Any]], bool]:
-    """Find current chunks, including entries created by the pre-idempotent version.
-
-    Returns ``(ids, metadatas, legacy_match)``. The legacy fallback makes the
-    first ingest after this upgrade replace old chunks that only had ``source``
-    metadata instead of leaving them alongside the new deterministic records.
-    """
+    """Find current chunks, including entries created by older index versions."""
     ids, metadatas = _collection_get_ids(store, where={"document_id": document_id})
     if ids:
         return ids, metadatas, False
@@ -111,29 +132,38 @@ def _find_existing_document(
     if ids:
         return ids, metadatas, False
 
-    # Backward-compatibility path for legacy records that stored only the basename.
+    # Backward compatibility for records that stored only the basename.
     ids, metadatas = _collection_get_ids(store, where={"source": source_name})
     return ids, metadatas, bool(ids)
 
 
-def _is_unchanged(
+def _is_index_current(
     ids: list[str],
     metadatas: list[dict[str, Any]],
-    document_hash: str,
+    index_fingerprint: str,
 ) -> bool:
-    """An indexed PDF is unchanged only when every stored chunk has the same hash."""
+    """Return True only when every stored chunk belongs to the current index version."""
     if not ids or len(ids) != len(metadatas):
         return False
-    return all(meta.get("document_hash") == document_hash for meta in metadatas)
+    return all(meta.get("index_fingerprint") == index_fingerprint for meta in metadatas)
+
+
+def _rollback_staged_chunks(store: Chroma, staged_ids: list[str]) -> None:
+    """Best-effort rollback of chunks created during a failed reindex."""
+    if not staged_ids:
+        return
+    try:
+        store._collection.delete(ids=staged_ids)  # noqa: SLF001
+    except Exception:
+        logger.exception("Failed to roll back %d staged chunk(s)", len(staged_ids))
 
 
 def ingest_pdfs(pdf_folder: str | Path | None = None) -> dict[str, int]:
-    """Index PDFs without duplicating chunks on repeated ingestion.
+    """Index PDFs idempotently while preserving the previous version on failure.
 
-    For every PDF we store a stable ``document_id`` and the current file
-    ``document_hash`` in metadata. If the same file is ingested again unchanged,
-    it is skipped. If its bytes changed, all previous chunks for that document
-    are deleted and the new chunks are inserted with deterministic ids.
+    New chunks are fully prepared and written first. Previous chunks are removed
+    only after the new version was stored successfully. If staging or cleanup
+    fails, newly staged ids are rolled back and the previous index is retained.
     """
     source_root = Path(pdf_folder or settings.pdf_folder).resolve()
     pdf_paths = _collect_pdf_paths(source_root)
@@ -144,12 +174,10 @@ def ingest_pdfs(pdf_folder: str | Path | None = None) -> dict[str, int]:
     persist_path = settings.chroma_persist_path
     persist_path.mkdir(parents=True, exist_ok=True)
 
-    # Chroma get_or_create semantics let us use one path for both a fresh and an
-    # already persisted collection.
     store = Chroma(
         persist_directory=str(persist_path),
         embedding_function=embeddings,
-        collection_name=settings.chroma_collection_name,
+        collection_name=_effective_collection_name(),
     )
 
     splitter = RecursiveCharacterTextSplitter(
@@ -166,6 +194,7 @@ def ingest_pdfs(pdf_folder: str | Path | None = None) -> dict[str, int]:
         relative_source = _source_path(pdf_path, source_root)
         document_id = _document_id(pdf_path, source_root)
         document_hash = _sha256_file(pdf_path)
+        index_fingerprint = _document_index_fingerprint(document_hash)
 
         existing_ids, existing_metadatas, legacy_match = _find_existing_document(
             store,
@@ -174,21 +203,16 @@ def ingest_pdfs(pdf_folder: str | Path | None = None) -> dict[str, int]:
             source_name=pdf_path.name,
         )
 
-        if not legacy_match and _is_unchanged(existing_ids, existing_metadatas, document_hash):
+        if not legacy_match and _is_index_current(
+            existing_ids,
+            existing_metadatas,
+            index_fingerprint,
+        ):
             files_skipped += 1
-            logger.info("Skipping unchanged PDF: %s", relative_source)
+            logger.info("Skipping unchanged PDF/index: %s", relative_source)
             continue
 
-        if existing_ids:
-            store._collection.delete(ids=existing_ids)  # noqa: SLF001
-            chunks_removed += len(existing_ids)
-            logger.info(
-                "Removed %d previously indexed chunk(s) for %s%s",
-                len(existing_ids),
-                relative_source,
-                " (legacy records)" if legacy_match else "",
-            )
-
+        # Prepare the complete new document version before touching old chunks.
         logger.info("Loading PDF: %s", pdf_path)
         loader = PyPDFLoader(str(pdf_path))
         pages = loader.load()
@@ -199,31 +223,62 @@ def ingest_pdfs(pdf_folder: str | Path | None = None) -> dict[str, int]:
             meta["source_path"] = relative_source
             meta["document_id"] = document_id
             meta["document_hash"] = document_hash
+            meta["index_fingerprint"] = index_fingerprint
+            meta["index_schema_version"] = settings.index_schema_version
             meta["page"] = int(meta.get("page", 0))
             doc.metadata = meta
 
         chunks = splitter.split_documents(pages)
-        chunk_ids: list[str] = []
+        if not chunks:
+            raise RuntimeError(
+                f"PDF produced no text chunks; previous index was kept unchanged: {relative_source}"
+            )
 
+        chunk_ids: list[str] = []
         for index, chunk in enumerate(chunks):
-            chunk_identifier = _chunk_id(document_id, index)
+            chunk_identifier = _chunk_id(document_id, index_fingerprint, index)
             meta = dict(chunk.metadata) if chunk.metadata else {}
             meta["chunk_index"] = index
             meta["chunk_id"] = chunk_identifier
             chunk.metadata = meta
             chunk_ids.append(chunk_identifier)
 
-        if chunks:
-            # LangChain's Chroma integration uses Chroma upsert under the hood.
-            # Explicit deterministic ids also make accidental duplicate writes
-            # safe if the same logical chunks are submitted again.
-            store.add_documents(chunks, ids=chunk_ids)
-            chunks_created += len(chunks)
-            logger.info("Indexed %d chunk(s) for %s", len(chunks), relative_source)
-        else:
-            logger.warning("PDF produced no text chunks: %s", relative_source)
+        existing_id_set = set(existing_ids)
+        new_id_set = set(chunk_ids)
+        staged_ids = [chunk_id for chunk_id in chunk_ids if chunk_id not in existing_id_set]
+        old_ids_to_remove = [chunk_id for chunk_id in existing_ids if chunk_id not in new_id_set]
 
+        # Stage the new version first. On failure, remove any newly introduced ids.
+        try:
+            store.add_documents(chunks, ids=chunk_ids)
+        except Exception:
+            _rollback_staged_chunks(store, staged_ids)
+            logger.exception("Failed to stage new chunks for %s; previous index kept", relative_source)
+            raise
+
+        # Commit the swap by removing only the previous version after staging succeeded.
+        if old_ids_to_remove:
+            try:
+                store._collection.delete(ids=old_ids_to_remove)  # noqa: SLF001
+            except Exception:
+                _rollback_staged_chunks(store, staged_ids)
+                logger.exception(
+                    "Failed to remove previous chunks for %s; staged version rolled back",
+                    relative_source,
+                )
+                raise
+
+            chunks_removed += len(old_ids_to_remove)
+            logger.info(
+                "Removed %d previous chunk(s) for %s%s",
+                len(old_ids_to_remove),
+                relative_source,
+                " (legacy records)" if legacy_match else "",
+            )
+
+        chunks_created += len(chunks)
         files_indexed += 1
+        logger.info("Indexed %d chunk(s) for %s", len(chunks), relative_source)
 
     collection_size = int(store._collection.count())  # noqa: SLF001
 
@@ -238,7 +293,7 @@ def ingest_pdfs(pdf_folder: str | Path | None = None) -> dict[str, int]:
 
 
 def get_vectorstore() -> Chroma:
-    """Load persisted Chroma. Raises a clear error if the store has not been created yet."""
+    """Load the Chroma collection for the current indexing configuration."""
     path = settings.chroma_persist_path
     if not path.exists() or not any(path.iterdir()):
         raise FileNotFoundError(
@@ -251,7 +306,7 @@ def get_vectorstore() -> Chroma:
         return Chroma(
             persist_directory=str(path),
             embedding_function=embeddings,
-            collection_name=settings.chroma_collection_name,
+            collection_name=_effective_collection_name(),
         )
     except Exception as exc:
         raise RuntimeError(f"Could not load Chroma vector store from '{path}': {exc}") from exc

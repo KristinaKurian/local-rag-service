@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     chroma_persist_path: Path = PROJECT_ROOT / "chroma_db"
     chroma_collection_name: str = "local_rag"
     pdf_folder: Path = PROJECT_ROOT / "data" / "pdfs"
+    index_schema_version: str = "1"
 
     # RAG
     chunk_size: int = Field(default=500, gt=0)

@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from fastapi import Body, Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from .config import settings
 from .graph import build_rag_graph, run_graph
@@ -64,6 +66,12 @@ def get_runtime(request: Request) -> AppRuntime:
     return runtime
 
 
+def _store_document_count(runtime: AppRuntime) -> int:
+    if runtime.vectorstore is None:
+        return 0
+    return int(runtime.vectorstore._collection.count())  # noqa: SLF001
+
+
 def _store_has_documents(runtime: AppRuntime) -> bool:
     if runtime.vectorstore is None:
         return False
@@ -79,8 +87,9 @@ def _store_has_documents(runtime: AppRuntime) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.runtime = AppRuntime()
+    app.state.ingest_lock = asyncio.Lock()
     try:
-        _reload_pipeline(app)
+        await run_in_threadpool(_reload_pipeline, app)
     except FileNotFoundError as exc:
         logger.warning("Vector store not ready at startup: %s", exc)
     except Exception:
@@ -107,13 +116,6 @@ def serve_ui() -> FileResponse:
     return FileResponse(index)
 
 
-class IngestBody(BaseModel):
-    folder_path: str | None = Field(
-        default=None,
-        description="Optional folder containing PDFs (recursive). Defaults to configured PDF_FOLDER.",
-    )
-
-
 class QueryBody(BaseModel):
     question: str = Field(..., min_length=1)
     use_graph: bool = True
@@ -137,7 +139,7 @@ async def status(runtime: AppRuntime = Depends(get_runtime)) -> dict[str, Any]:
     documents_indexed = 0
     if runtime.vectorstore is not None:
         try:
-            documents_indexed = int(runtime.vectorstore._collection.count())  # noqa: SLF001
+            documents_indexed = await run_in_threadpool(_store_document_count, runtime)
         except Exception:
             logger.exception("Could not read Chroma document count")
 
@@ -152,34 +154,35 @@ async def status(runtime: AppRuntime = Depends(get_runtime)) -> dict[str, Any]:
 
 
 @app.post("/ingest")
-async def ingest(
-    request: Request,
-    body: IngestBody | None = Body(default=None),
-) -> dict[str, Any]:
-    folder = body.folder_path if body and body.folder_path else settings.pdf_folder
-    logger.info("Ingest requested for folder: %s", folder)
-    try:
-        summary = ingest_pdfs(folder)
-    except Exception as exc:
-        logger.exception("Ingest failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+async def ingest(request: Request) -> dict[str, Any]:
+    # The HTTP API intentionally indexes only the operator-configured PDF root.
+    # Arbitrary filesystem paths are not accepted from untrusted request data.
+    folder = settings.pdf_folder
+    logger.info("Ingest requested for configured folder: %s", folder)
 
-    try:
-        _reload_pipeline(request.app)
-    except FileNotFoundError:
-        if summary["chunks_created"] > 0:
-            logger.exception("Reload after ingest failed: vector store missing despite new chunks")
+    async with request.app.state.ingest_lock:
+        try:
+            summary = await run_in_threadpool(ingest_pdfs, folder)
+        except Exception as exc:
+            logger.exception("Ingest failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        try:
+            await run_in_threadpool(_reload_pipeline, request.app)
+        except FileNotFoundError:
+            if summary["chunks_created"] > 0:
+                logger.exception("Reload after ingest failed: vector store missing despite new chunks")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Ingest reported new chunks but the vector store could not be loaded.",
+                ) from None
+            logger.warning("Ingest completed with no indexed chunks; vector store not initialized.")
+        except Exception as exc:
+            logger.exception("Reload after ingest failed")
             raise HTTPException(
                 status_code=500,
-                detail="Ingest reported new chunks but the vector store could not be loaded.",
-            ) from None
-        logger.warning("Ingest completed with no indexed chunks; vector store not initialized.")
-    except Exception as exc:
-        logger.exception("Reload after ingest failed")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Ingest succeeded but failed to reload vector store: {exc}",
-        ) from exc
+                detail=f"Ingest succeeded but failed to reload vector store: {exc}",
+            ) from exc
 
     return {
         "status": "success",
@@ -197,7 +200,11 @@ async def query(
     body: QueryBody,
     runtime: AppRuntime = Depends(get_runtime),
 ) -> dict[str, Any]:
-    if runtime.vectorstore is None or not _store_has_documents(runtime):
+    has_documents = (
+        runtime.vectorstore is not None
+        and await run_in_threadpool(_store_has_documents, runtime)
+    )
+    if not has_documents:
         raise HTTPException(
             status_code=400,
             detail="No documents found. Please ingest PDFs first via POST /ingest",
@@ -210,12 +217,12 @@ async def query(
         if use_graph:
             if runtime.rag_graph is None:
                 raise HTTPException(status_code=503, detail="LangGraph pipeline is not initialized.")
-            out = run_graph(runtime.rag_graph, body.question)
+            out = await run_in_threadpool(run_graph, runtime.rag_graph, body.question)
             pipeline = "langgraph"
         else:
             if runtime.rag_chain is None:
                 raise HTTPException(status_code=503, detail="LangChain pipeline is not initialized.")
-            out = query_chain(runtime.rag_chain, body.question)
+            out = await run_in_threadpool(query_chain, runtime.rag_chain, body.question)
             pipeline = "langchain"
     except HTTPException:
         raise

@@ -30,10 +30,10 @@ Before creating the venv, confirm the interpreter: `python --version` should rep
 ## Usage
 
 1. Copy PDFs into `data/pdfs/` (subfolders are fine; ingestion is recursive).
-2. Click **Ingest PDFs** in the sidebar (or `POST /ingest`). Ingestion is idempotent: unchanged PDFs are skipped, while changed PDFs replace their previously indexed chunks.
+2. Click **Ingest PDFs** in the sidebar (or `POST /ingest`). The HTTP endpoint always indexes the configured `PDF_FOLDER`; request data cannot select arbitrary filesystem paths. Ingestion is idempotent: unchanged PDFs are skipped only when both the PDF content and indexing configuration are unchanged. Changed documents are staged before their previous chunks are removed.
 3. Choose **Langgraph** or **Langchain** as the pipeline, then chat.
 
-The vector database is written to `chroma_db/` on disk and reused across restarts. Repeating `/ingest` with unchanged files does not duplicate chunks.
+The vector database is written to `chroma_db/` on disk and reused across restarts. Repeating `/ingest` with unchanged files does not duplicate chunks. Embedding/chunking configuration is fingerprinted into the physical Chroma collection, so changing the embedding model, normalization, chunk size/overlap, or `INDEX_SCHEMA_VERSION` creates a separate compatible index and requires one new `/ingest`.
 
 ## API
 
@@ -42,7 +42,7 @@ The vector database is written to `chroma_db/` on disk and reused across restart
 | ------ | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET`  | `/health` | Liveness probe: `{ "status": "ok" }`.                                                                                                                                                                                                                                                       |
 | `GET`  | `/status` | Ollama reachability (`/api/tags`), indexed chunk count, active models, `top_k_results`, and the current relevance-score threshold. |
-| `POST` | `/ingest` | Body: `{ "folder_path": "<optional path>" }`. Defaults to configured `data/pdfs`. Idempotently indexes PDFs in Chroma: unchanged files are skipped and changed files replace old chunks. Returns processing, skip, replacement, and collection-size counters.                                                                                            |
+| `POST` | `/ingest` | No request path is accepted; indexes the configured `PDF_FOLDER` only. Unchanged document/index fingerprints are skipped. Changed versions are staged first, then old chunks are removed. Returns processing, skip, replacement, and collection-size counters. |
 | `POST` | `/query`  | Body: `{ "question": "<text>", "use_graph": true }`. Both pipelines retrieve `TOP_K_RESULTS` candidates and keep only chunks whose relevance score is at least `RELEVANCE_SCORE_THRESHOLD`. Returns `answer`, `sources`, `chunks_used`, `retrieval_scores`, and `pipeline`. |
 
 
