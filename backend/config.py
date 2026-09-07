@@ -42,7 +42,9 @@ class Settings(BaseSettings):
     ollama_status_timeout_seconds: float = Field(default=5.0, gt=0)
 
     # Embeddings
-    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_model: str = (
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    )
     embedding_device: str = "cpu"
     normalize_embeddings: bool = True
 
